@@ -31,9 +31,26 @@ export namespace Auth {
 
   const filepath = path.join(Global.Path.data, "auth.json")
 
+  type Source = (providerID: string) => Promise<Info | undefined>
+
+  let source: Source | undefined
+
   export async function get(providerID: string) {
+    if (source) {
+      const resolved = await source(providerID).catch(() => undefined)
+      if (resolved) return resolved
+    }
     const auth = await all()
     return auth[providerID]
+  }
+
+  /**
+   * Replace the credential source. OpenCode V2 plugins inject an integration
+   * connection resolver here during setup; the default reads the legacy
+   * `auth.json` file so keys saved before the V2 upgrade keep working.
+   */
+  export function use(next: Source | undefined) {
+    source = next
   }
 
   export async function all(): Promise<Record<string, Info>> {

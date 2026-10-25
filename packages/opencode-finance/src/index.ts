@@ -2,7 +2,8 @@ import fs from "fs/promises"
 import path from "path"
 import { fileURLToPath } from "url"
 import z from "zod"
-import { type Plugin, tool as pluginTool, type Hooks } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
+import { Auth } from "./auth"
 import { FINANCE_AUTH_PROVIDER, type FinanceAuthProviderID } from "./finance/auth-provider"
 import { resolveProviderApiKey } from "./finance/credentials"
 import { FINANCE_SLASH_COMMANDS } from "./command/finance"
@@ -14,6 +15,7 @@ import { ReportGovernmentTradingTool } from "./tool/report-government-trading"
 import { ReportDarkpoolAnomalyTool } from "./tool/report-darkpool"
 import { FinancialPoliticalBacktestTool } from "./tool/financial-political-backtest"
 import { ReportPdfTool } from "./tool/pdf"
+import { Tool } from "./tool/tool"
 import { Env } from "./env"
 import { reportExecutionConstraintLines } from "./internal/report-execution-constraints"
 import PROMPT_FINANCE from "./prompt/finance.txt"
@@ -55,21 +57,21 @@ const ONBOARD_TEMPLATE = [
   "5) End with one concise readiness summary and next actions.",
 ].join("\n")
 
-function root(context: { directory: string; worktree: string }) {
-  return context.worktree === "/" ? context.directory : context.worktree
-}
-
-function reportRoot(
-  ticker: string,
-  context: { directory: string; worktree: string },
-  date = new Date().toISOString().slice(0, 10),
-) {
-  return path.join(root(context), "reports", ticker, date)
+const ONBOARD_COMMAND = {
+  name: "onboard",
+  description: "Run finance plugin setup checks",
+  template: ONBOARD_TEMPLATE,
 }
 
 function parseArgs(input: string) {
   const raw = input.match(/(?:[^\s"'`]+|"[^"]*"|'[^']*'|`[^`]*`)/g) ?? []
   return raw.map((arg) => arg.replace(/^['"`]|['"`]$/g, ""))
+}
+
+function expandTemplate(template: string, args: string[]) {
+  return template
+    .replaceAll("$ARGUMENTS", args.join(" "))
+    .replaceAll(/\$(\d+)/g, (match, index: string) => args[Number(index) - 1] ?? match)
 }
 
 async function missingRequired() {
@@ -86,8 +88,8 @@ async function missingRecommended() {
   return checks.filter((item) => !item.ok).map((item) => item.id)
 }
 
-async function ensureSkill(context: { directory: string; worktree: string }) {
-  const target = path.join(root(context), ".opencode", "skills", REPORT_SKILL, "SKILL.md")
+async function ensureSkill(directory: string) {
+  const target = path.join(directory, ".opencode", "skills", REPORT_SKILL, "SKILL.md")
   if (await exists(target)) return target
 
   const gist = (Env.get(REPORT_SKILL_GIST_ENV) ?? "").trim()
@@ -107,7 +109,85 @@ async function ensureSkill(context: { directory: string; worktree: string }) {
   return target
 }
 
-async function buildTools() {
+function reportRoot(ticker: string, directory: string, date = new Date().toISOString().slice(0, 10)) {
+  return path.join(directory, "reports", ticker, date)
+}
+
+async function reportCommandText(template: string, args: string[], directory: string) {
+  const ticker = (args[0] ?? "").trim().toUpperCase()
+  if (!ticker) {
+    throw new Error("Missing ticker for `/report`. Usage: `/report <ticker> [focus]`.\nRun `/onboard` first.")
+  }
+
+  await ensureSkill(directory)
+  const missing = await missingRequired()
+  if (missing.length > 0) {
+    throw new Error(
+      [
+        `Missing required dependencies for \`/report\`: ${missing.join(", ")}.`,
+        ...missing.map((id) => `- ${login(id)}`),
+        "Run `/onboard` to complete setup.",
+      ].join("\n"),
+    )
+  }
+
+  const recommended = await missingRecommended()
+  const focus = args.slice(1).join(" ").trim()
+  const constraints = reportExecutionConstraintLines({
+    outputRoot: reportRoot(ticker, directory),
+    focus,
+    quiverSetupHint: login("quiver-quant"),
+  })
+
+  return [
+    expandTemplate(template, args),
+    ...(recommended.length > 0
+      ? [`Note: optional providers missing: ${recommended.join(", ")}. Coverage may be reduced.`]
+      : []),
+    ...constraints,
+  ].join("\n\n")
+}
+
+async function politicalBacktestCommandText(args: string[], directory: string) {
+  const first = (args[0] ?? "").trim()
+  const firstLower = first.toLowerCase()
+  const tickerCandidate =
+    first && firstLower !== "portfolio" && /^[a-z0-9.\-]+$/i.test(first) && !first.includes(",") ? first.toUpperCase() : ""
+  const mode = tickerCandidate ? "ticker" : "portfolio"
+  const date = new Date().toISOString().slice(0, 10)
+  const scopeRoot = path.join(
+    directory,
+    "reports",
+    "political-backtest",
+    mode === "ticker" ? tickerCandidate : "portfolio",
+    date,
+  )
+
+  const quiver = await resolveProviderApiKey("quiver-quant", { trim: true })
+  if (!quiver) {
+    throw new Error(
+      [
+        "Missing required dependency for `/financial-political-backtest`: quiver-quant.",
+        `- ${login("quiver-quant")}`,
+        "Run `/onboard` to complete setup.",
+      ].join("\n"),
+    )
+  }
+
+  return [
+    "Execution constraints for this `/financial-political-backtest` run:",
+    `- Inferred mode: \`${mode}\`.`,
+    `- Write artifacts under \`${scopeRoot}\`.`,
+    "- Enforce strict failure for missing required datasets, windows, or benchmark series.",
+    "- Keep outputs analytic and non-advisory.",
+    "- After successful markdown artifacts, ask exactly one PDF question using `question`.",
+    '- If user chooses `Yes (Recommended)`, call `report_pdf` with `subcommand: "political-backtest"` and the tool-reported output root.',
+    "- If user chooses `No`, skip PDF export.",
+    "- If `report_pdf` fails, report the explicit error and treat the run as failed.",
+  ].join("\n")
+}
+
+async function prepareTools() {
   const list = [
     FinancialSearchTool,
     PortfolioTool,
@@ -118,266 +198,156 @@ async function buildTools() {
     FinancialPoliticalBacktestTool,
     ReportPdfTool,
   ]
-  const out: Hooks["tool"] = {}
+  const out: Array<{
+    id: string
+    description: string
+    parameters: z.ZodObject<any>
+    execute: (args: any, ctx: Tool.Context) => Promise<{ title: string; metadata: any; output: string }>
+  }> = []
   for (const item of list) {
     const init = await item.init()
     if (!(init.parameters instanceof z.ZodObject)) {
       throw new Error(`finance plugin tool ${item.id} must declare a Zod object schema`)
     }
-    out[item.id] = pluginTool({
+    out.push({
+      id: item.id,
       description: init.description,
-      args: init.parameters.shape,
-      async execute(args, context) {
-        const result = await init.execute(args as any, context as any)
-        context.metadata({
-          title: result.title,
-          metadata: result.metadata,
-        })
-        return result.output
-      },
+      parameters: init.parameters,
+      execute: init.execute as any,
     })
   }
   return out
 }
 
-function commandTemplate() {
-  const command = FINANCE_SLASH_COMMANDS.reduce(
-    (acc, item) => {
-      acc[item.name] = {
-        description: item.description,
-        template: item.template,
-      }
-      return acc
-    },
-    {} as Record<string, { description: string; template: string }>,
-  )
-  command.onboard = {
-    description: "Run finance plugin setup checks",
-    template: ONBOARD_TEMPLATE,
-  }
-  return command
-}
+const authKeyField = (title: string, placeholder?: string) => ({
+  type: "string" as const,
+  key: "key",
+  title,
+  required: true,
+  ...(placeholder ? { placeholder } : {}),
+})
 
-function ensureAuthProviderVisibility(config: Parameters<NonNullable<Hooks["config"]>>[0]) {
-  if (Array.isArray(config.enabled_providers)) {
-    config.enabled_providers = Array.from(new Set([...config.enabled_providers, ...AUTH_LOGIN_PROVIDER]))
-  }
+const authTierField = () => ({
+  type: "string" as const,
+  key: "tier",
+  title: "Select your Quiver Quant plan tier",
+  required: true,
+  options: [
+    { value: "tier_1", label: "Public (Tier 0)" },
+    { value: "tier_2", label: "Hobbyist (Tier 0 + Tier 1)" },
+    { value: "tier_3", label: "Trader (Tier 0 + Tier 1 + Tier 2)" },
+    { value: "enterprise", label: "Enterprise (Tier 0 + Tier 1 + Tier 2)" },
+  ],
+})
 
-  const provider = (config.provider ??= {})
-  for (const id of AUTH_LOGIN_PROVIDER) {
-    const current = provider[id]
-    if (current?.name?.trim()) continue
-    provider[id] = {
-      ...(current ?? {}),
-      name: FINANCE_AUTH_PROVIDER[id].name,
-    }
-  }
-}
+export default Plugin.define({
+  id: "opencode-finance",
+  async setup(ctx) {
+    const directory = ctx.location.directory
+    const tools = await prepareTools()
 
-function authPlugin(input: {
-  provider: FinanceAuthProviderID
-  label: string
-  prompts?: NonNullable<NonNullable<Hooks["auth"]>["methods"][number]["prompts"]>
-  metadata?: (values: Record<string, string>) => Record<string, string | number | boolean> | undefined
-}) {
-  const plugin: Plugin = async () => ({
-    auth: {
-      provider: input.provider,
-      methods: [
-        {
-          type: "api",
-          label: input.label,
-          prompts: input.prompts,
-          async authorize(values) {
-            const key = values?.key?.trim()
-            if (!key) return { type: "failed" }
+    await ctx.tool.transform((editor) => {
+      for (const tool of tools) {
+        editor.add({
+          name: tool.id,
+          description: tool.description,
+          input: tool.parameters,
+          async execute(input, context) {
+            const result = await tool.execute(input as any, {
+              directory,
+              worktree: "/",
+              abort: context.signal,
+              async ask(request) {
+                await ctx.permission.assert({
+                  sessionID: context.sessionID,
+                  agent: context.agent,
+                  source: { type: "tool", messageID: context.messageID, id: context.id },
+                  action: request.permission,
+                  resources: request.patterns,
+                  save: request.always,
+                  metadata: request.metadata,
+                })
+              },
+              metadata(update) {
+                void context.progress({
+                  ...(update.title !== undefined ? { title: update.title } : {}),
+                  ...update.metadata,
+                })
+              },
+            })
             return {
-              type: "success",
-              key,
-              metadata: input.metadata?.(values ?? {}),
+              content: result.output,
+              metadata: { title: result.title, ...result.metadata },
             }
           },
-        },
-      ],
-    },
-  })
-  return plugin
-}
-
-const textPrompt = (message: string, placeholder?: string) =>
-  ({
-    type: "text" as const,
-    key: "key",
-    message,
-    ...(placeholder ? { placeholder } : {}),
-    validate(value: string) {
-      if (!value.trim()) return "Required"
-    },
-  }) satisfies NonNullable<NonNullable<Hooks["auth"]>["methods"][number]["prompts"]>[number]
-
-export const OpenCodeFinancePlugin: Plugin = async (input) => {
-  const tools = await buildTools()
-
-  return {
-    tool: tools,
-    async config(config) {
-      ensureAuthProviderVisibility(config)
-      config.command = {
-        ...(config.command ?? {}),
-        ...commandTemplate(),
+        })
       }
-    },
-    async "experimental.chat.system.transform"(_input, output) {
-      output.system.push(PROMPT_FINANCE)
-    },
-    async "command.execute.before"(event, output) {
-      if (event.command === "report") {
-        const parts = parseArgs(event.arguments)
-        const ticker = (parts[0] ?? "").trim().toUpperCase()
-        if (!ticker) {
-          throw new Error("Missing ticker for `/report`. Usage: `/report <ticker> [focus]`.\nRun `/onboard` first.")
-        }
+    })
 
-        await ensureSkill(input)
-        const missing = await missingRequired()
-        if (missing.length > 0) {
-          throw new Error(
-            [
-              `Missing required dependencies for \`/report\`: ${missing.join(", ")}.`,
-              ...missing.map((id) => `- ${login(id)}`),
-              "Run `/onboard` to complete setup.",
-            ].join("\n"),
-          )
-        }
+    await ctx.command.transform((editor) => {
+      for (const command of [...FINANCE_SLASH_COMMANDS, ONBOARD_COMMAND]) {
+        editor.add({
+          name: command.name,
+          description: command.description,
+          async execute({ sessionID, prompt, delivery }) {
+            const args = parseArgs(prompt.text)
+            let text = expandTemplate(command.template, args)
 
-        const recommended = await missingRecommended()
-        if (recommended.length > 0) {
-          await input.client.tui.showToast({
-            body: {
-              variant: "warning",
-              message: `Optional providers missing: ${recommended.join(", ")}. Coverage may be reduced.`,
-              duration: 9000,
-            },
-          })
-        }
+            if (command.name === "report") {
+              text = await reportCommandText(command.template, args, directory)
+            } else if (command.name === "financial-political-backtest") {
+              text = [text, await politicalBacktestCommandText(args, directory)].join("\n\n")
+            }
 
-        const focus = parts.slice(1).join(" ").trim()
-        output.parts.push({
-          type: "text",
-          text: reportExecutionConstraintLines({
-            outputRoot: reportRoot(ticker, input),
-            focus,
-            quiverSetupHint: login("quiver-quant"),
-          }).join("\n"),
-        } as any)
-        return
+            await ctx.session.prompt({ ...prompt, sessionID, text, delivery })
+          },
+        })
       }
+    })
 
-      if (event.command !== "financial-political-backtest") return
+    await ctx.session.hook("context", (event) => {
+      event.system.push({ type: "text", text: PROMPT_FINANCE })
+    })
 
-      const parts = parseArgs(event.arguments)
-      const first = (parts[0] ?? "").trim()
-      const firstLower = first.toLowerCase()
-      const tickerCandidate =
-        first && firstLower !== "portfolio" && /^[a-z0-9.\-]+$/i.test(first) && !first.includes(",") ? first.toUpperCase() : ""
-      const mode = tickerCandidate ? "ticker" : "portfolio"
-      const date = new Date().toISOString().slice(0, 10)
-      const scopeRoot = path.join(
-        root(input),
-        "reports",
-        "political-backtest",
-        mode === "ticker" ? tickerCandidate : "portfolio",
-        date,
-      )
-
-      const quiver = await resolveProviderApiKey("quiver-quant", { trim: true })
-      if (!quiver) {
-        throw new Error(
-          [
-            "Missing required dependency for `/financial-political-backtest`: quiver-quant.",
-            `- ${login("quiver-quant")}`,
-            "Run `/onboard` to complete setup.",
-          ].join("\n"),
-        )
+    await ctx.integration.transform((editor) => {
+      for (const id of AUTH_LOGIN_PROVIDER) {
+        editor.update(id, (integration) => {
+          integration.name = FINANCE_AUTH_PROVIDER[id].name
+        })
+        editor.method.update({
+          integrationID: id,
+          method: {
+            type: "key",
+            label: FINANCE_AUTH_PROVIDER[id].name,
+            form:
+              id === "quiver-quant"
+                ? [authKeyField("Enter your Quiver Quant API key"), authTierField()]
+                : id === "sec-edgar"
+                  ? [authKeyField("Enter SEC EDGAR identity", "MyCompany dev@mycompany.com")]
+                  : [
+                      authKeyField(
+                        `Enter your ${FINANCE_AUTH_PROVIDER[id].name} API key`,
+                      ),
+                    ],
+          },
+        })
       }
+    })
 
-      output.parts.push({
-        type: "text",
-        text: [
-          "Execution constraints for this `/financial-political-backtest` run:",
-          `- Inferred mode: \`${mode}\`.`,
-          `- Write artifacts under \`${scopeRoot}\`.`,
-          "- Enforce strict failure for missing required datasets, windows, or benchmark series.",
-          "- Keep outputs analytic and non-advisory.",
-          "- After successful markdown artifacts, ask exactly one PDF question using `question`.",
-          '- If user chooses `Yes (Recommended)`, call `report_pdf` with `subcommand: "political-backtest"` and the tool-reported output root.',
-          "- If user chooses `No`, skip PDF export.",
-          "- If `report_pdf` fails, report the explicit error and treat the run as failed.",
-        ].join("\n"),
-      } as any)
-    },
-  }
-}
+    Auth.use(async (providerID) => {
+      const connection = await ctx.integration.connection.active(providerID)
+      if (!connection) return
+      const credential = await ctx.integration.connection.resolve(connection)
+      if (!credential || credential.type !== "key") return
+      const parsed = Auth.Api.safeParse({
+        type: "api",
+        key: credential.key,
+        provider_tier: credential.metadata?.provider_tier,
+        provider_tag: credential.metadata?.provider_tag,
+      })
+      return parsed.success ? parsed.data : undefined
+    })
 
-export const AlphaVantageAuthPlugin = authPlugin({
-  provider: "alphavantage",
-  label: "Alpha Vantage API key",
-  prompts: [textPrompt("Enter your Alpha Vantage API key")],
-})
-
-export const FinnhubAuthPlugin = authPlugin({
-  provider: "finnhub",
-  label: "Finnhub API key",
-  prompts: [textPrompt("Enter your Finnhub API key")],
-})
-
-export const FinancialModelingPrepAuthPlugin = authPlugin({
-  provider: "financial-modeling-prep",
-  label: "Financial Modeling Prep API key",
-  prompts: [textPrompt("Enter your Financial Modeling Prep API key")],
-})
-
-export const PolygonAuthPlugin = authPlugin({
-  provider: "polygon",
-  label: "Polygon API key",
-  prompts: [textPrompt("Enter your Polygon API key")],
-})
-
-export const QuartrAuthPlugin = authPlugin({
-  provider: "quartr",
-  label: "Quartr API key",
-  prompts: [textPrompt("Enter your Quartr API key")],
-})
-
-export const SecEdgarAuthPlugin = authPlugin({
-  provider: "sec-edgar",
-  label: "SEC EDGAR identity",
-  prompts: [textPrompt("Enter SEC EDGAR identity", "MyCompany dev@mycompany.com")],
-})
-
-export const QuiverQuantAuthPlugin = authPlugin({
-  provider: "quiver-quant",
-  label: "Quiver Quant API key",
-  prompts: [
-    textPrompt("Enter your Quiver Quant API key"),
-    {
-      type: "select",
-      key: "tier",
-      message: "Select your Quiver Quant plan tier",
-      options: [
-        { label: "Public (Tier 0)", value: "tier_1" },
-        { label: "Hobbyist (Tier 0 + Tier 1)", value: "tier_2" },
-        { label: "Trader (Tier 0 + Tier 1 + Tier 2)", value: "tier_3" },
-        { label: "Enterprise (Tier 0 + Tier 1 + Tier 2)", value: "enterprise" },
-      ],
-    },
-  ],
-  metadata(values) {
-    const tier = values.tier?.trim()
-    if (!tier) return
-    return {
-      provider_tier: tier,
-      provider_tag: "quiver-quant",
-    }
+    return () => Auth.use(undefined)
   },
 })

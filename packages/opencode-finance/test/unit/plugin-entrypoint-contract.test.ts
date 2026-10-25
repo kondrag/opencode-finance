@@ -7,15 +7,40 @@ import { pathToFileURL } from "url"
 const packageDir = path.resolve(import.meta.dir, "../..")
 const distEntrypoint = pathToFileURL(path.join(packageDir, "dist/index.js")).href
 const openClawEntrypoint = pathToFileURL(path.join(packageDir, "dist/openclaw/index.cjs")).href
-const expectedExports = [
-  "AlphaVantageAuthPlugin",
-  "FinancialModelingPrepAuthPlugin",
-  "FinnhubAuthPlugin",
-  "OpenCodeFinancePlugin",
-  "PolygonAuthPlugin",
-  "QuartrAuthPlugin",
-  "QuiverQuantAuthPlugin",
-  "SecEdgarAuthPlugin",
+const expectedToolNames = [
+  "financial_search",
+  "portfolio",
+  "portfolio_report",
+  "report_insiders",
+  "report_government_trading",
+  "report_darkpool_anomaly",
+  "financial_political_backtest",
+  "report_pdf",
+]
+const expectedCommandNames = [
+  "quote",
+  "metrics",
+  "filings",
+  "watch",
+  "portfolio",
+  "report-portfolio",
+  "report-insiders",
+  "financial-government-trading",
+  "financial-political-backtest",
+  "market",
+  "financial-darkpool-anomaly",
+  "report-pdf",
+  "report",
+  "onboard",
+]
+const expectedAuthIntegrations = [
+  "alphavantage",
+  "finnhub",
+  "financial-modeling-prep",
+  "polygon",
+  "quartr",
+  "sec-edgar",
+  "quiver-quant",
 ]
 
 async function loadEntrypoint() {
@@ -32,18 +57,88 @@ async function loadOpenClawPlugin() {
   }
 }
 
-function createPluginInput() {
-  return {
-    client: {
-      tui: {
-        async showToast() {},
+function registration() {
+  return { dispose: async () => {} }
+}
+
+function createStubContext() {
+  const tools: Array<{ name: string }> = []
+  const commands: Array<{ name: string; execute: (input: any) => Promise<void> }> = []
+  const integrations: Array<{ integrationID: string; method: { type: string; form?: unknown[] } }> = []
+  const sessionHooks: Record<string, (event: any) => unknown> = {}
+  let prompt: ((input: { sessionID: string; text: string }) => Promise<unknown>) | undefined
+
+  const context = {
+    app: { version: "0.0.0-test" },
+    location: { directory: packageDir, project: { id: "test", directory: packageDir, canonical: packageDir } },
+    options: {},
+    integration: {
+      transform: async (callback: (editor: any) => unknown) => {
+        await callback({
+          list: () => [],
+          get: () => undefined,
+          update: () => {},
+          method: {
+            list: () => [],
+            update: (input: { integrationID: string; method: { type: string; form?: unknown[] } }) => {
+              integrations.push(input)
+            },
+            remove: () => {},
+          },
+        })
+        return registration()
+      },
+      connection: {
+        active: async () => undefined,
+        resolve: async () => undefined,
       },
     },
-    project: {},
-    directory: packageDir,
-    worktree: packageDir,
-    serverUrl: new URL("http://localhost"),
-    $: {},
+    session: {
+      hook: async (name: string, callback: (event: any) => unknown) => {
+        sessionHooks[name] = callback
+        return registration()
+      },
+      prompt: async (input: { sessionID: string; text: string }) => {
+        if (!prompt) throw new Error("unexpected session.prompt call")
+        return prompt(input)
+      },
+    },
+    tool: {
+      transform: async (callback: (editor: any) => unknown) => {
+        await callback({
+          list: () => [],
+          get: () => undefined,
+          namespace: () => {},
+          add: (tool: { name: string }) => {
+            tools.push(tool)
+          },
+          update: () => {},
+          remove: () => {},
+        })
+        return registration()
+      },
+    },
+    command: {
+      transform: async (callback: (editor: any) => unknown) => {
+        await callback({
+          add: (command: { name: string; execute: (input: any) => Promise<void> }) => {
+            commands.push(command)
+          },
+        })
+        return registration()
+      },
+    },
+  }
+
+  return {
+    context,
+    tools,
+    commands,
+    integrations,
+    sessionHooks,
+    onPrompt(callback: (input: { sessionID: string; text: string }) => Promise<unknown>) {
+      prompt = callback
+    },
   }
 }
 
@@ -60,29 +155,61 @@ function parsePackFiles(raw: string) {
 }
 
 describe("plugin package entrypoint contract", () => {
-  test("exports only plugin functions", async () => {
+  test("default-exports a V2 plugin definition", async () => {
     const entrypoint = await loadEntrypoint()
     const names = Object.keys(entrypoint).toSorted()
 
-    expect(names).toEqual(expectedExports.toSorted())
-    expect(names).not.toContain("default")
-    expect(names).not.toContain("OpenCodeFinanceInternal")
+    expect(names).toEqual(["default"])
 
-    for (const value of Object.values(entrypoint)) {
-      expect(typeof value).toBe("function")
-    }
+    const plugin = entrypoint.default as { id?: string; setup?: unknown }
+    expect(plugin.id).toBe("opencode-finance")
+    expect(typeof plugin.setup).toBe("function")
   })
 
-  test("all exported plugins initialize without throwing", async () => {
+  test("setup registers tools, commands, session hook, and auth integrations", async () => {
     const entrypoint = await loadEntrypoint()
-    const input = createPluginInput()
+    const plugin = entrypoint.default as { id: string; setup: (context: unknown) => Promise<unknown> }
+    const { context, tools, commands, integrations, sessionHooks } = createStubContext()
 
-    for (const [name, plugin] of Object.entries(entrypoint)) {
-      const hooks = await plugin(input as any)
-      expect(hooks).toBeTruthy()
-      expect(typeof hooks).toBe("object")
-      expect(name.length).toBeGreaterThan(0)
+    const cleanup = await plugin.setup(context)
+    expect(typeof cleanup).toBe("function")
+
+    expect(tools.map((tool) => tool.name).toSorted()).toEqual(expectedToolNames.toSorted())
+    expect(commands.map((command) => command.name).toSorted()).toEqual(expectedCommandNames.toSorted())
+    expect(integrations.map((entry) => entry.integrationID).toSorted()).toEqual(expectedAuthIntegrations.toSorted())
+
+    for (const entry of integrations) {
+      expect(entry.method.type).toBe("key")
+      expect(Array.isArray(entry.method.form)).toBe(true)
     }
+
+    expect(typeof sessionHooks.context).toBe("function")
+
+    const event = { system: [] as Array<{ type: string; text?: string }> }
+    await sessionHooks.context(event)
+    expect(event.system.length).toBeGreaterThan(0)
+    expect(event.system[0]?.type).toBe("text")
+    expect(event.system[0]?.text?.length).toBeGreaterThan(0)
+  })
+
+  test("report command rejects missing ticker before submitting a prompt", async () => {
+    const entrypoint = await loadEntrypoint()
+    const plugin = entrypoint.default as { id: string; setup: (context: unknown) => Promise<unknown> }
+    let submitted: string | undefined
+    const { context, commands, onPrompt } = createStubContext()
+    onPrompt(async (input) => {
+      submitted = input.text
+    })
+
+    await plugin.setup(context)
+
+    const report = commands.find((command) => command.name === "report")
+    expect(report).toBeTruthy()
+
+    await expect(
+      report!.execute({ sessionID: "ses_test", prompt: { text: "" }, delivery: "steer" }),
+    ).rejects.toThrow(/Missing ticker for `\/report`/)
+    expect(submitted).toBeUndefined()
   })
 
   test("built OpenClaw entrypoint imports under Node without Bun globals", () => {
