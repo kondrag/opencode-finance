@@ -67,6 +67,7 @@ function createStubContext() {
   const integrations: Array<{ integrationID: string; method: { type: string; form?: unknown[] } }> = []
   const sessionHooks: Record<string, (event: any) => unknown> = {}
   let prompt: ((input: { sessionID: string; text: string }) => Promise<unknown>) | undefined
+  let sessionGet: ((input: { sessionID: string }) => Promise<unknown>) | undefined
 
   const context = {
     app: { version: "0.0.0-test" },
@@ -94,6 +95,10 @@ function createStubContext() {
       },
     },
     session: {
+      get: async (input: { sessionID: string }) => {
+        if (!sessionGet) throw new Error("unexpected session.get call")
+        return sessionGet(input)
+      },
       hook: async (name: string, callback: (event: any) => unknown) => {
         sessionHooks[name] = callback
         return registration()
@@ -138,6 +143,9 @@ function createStubContext() {
     sessionHooks,
     onPrompt(callback: (input: { sessionID: string; text: string }) => Promise<unknown>) {
       prompt = callback
+    },
+    onSessionGet(callback: (input: { sessionID: string }) => Promise<unknown>) {
+      sessionGet = callback
     },
   }
 }
@@ -210,6 +218,39 @@ describe("plugin package entrypoint contract", () => {
       report!.execute({ sessionID: "ses_test", prompt: { text: "" }, delivery: "steer" }),
     ).rejects.toThrow(/Missing ticker for `\/report`/)
     expect(submitted).toBeUndefined()
+  })
+
+  test("report command materializes the skill under the session's current directory", async () => {
+    const entrypoint = await loadEntrypoint()
+    const plugin = entrypoint.default as { id: string; setup: (context: unknown) => Promise<unknown> }
+    const sessionDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "opencode-finance-report-dir-")))
+    const { context, commands, onPrompt, onSessionGet } = createStubContext()
+    onPrompt(async () => {})
+    onSessionGet(async () => ({ location: { directory: sessionDir } }))
+
+    const cleanup = await plugin.setup(context)
+    try {
+      const report = commands.find((command) => command.name === "report")
+      expect(report).toBeTruthy()
+
+      // The provider gate may reject (no sec-edgar key in this environment) or
+      // reach prompt submission; either outcome proves ensureSkill ran against
+      // the session's directory, not the directory captured at setup.
+      await report!.execute({ sessionID: "ses_moved", prompt: { text: "AAPL" }, delivery: "steer" }).then(
+        () => {},
+        () => {},
+      )
+
+      const skill = path.join(sessionDir, ".opencode", "skills", "finance-comprehensive-report", "SKILL.md")
+      expect(fs.existsSync(skill)).toBe(true)
+      expect(fs.statSync(skill).size).toBeGreaterThan(0)
+
+      // The setup directory must not receive the skill as a fallback.
+      expect(fs.existsSync(path.join(packageDir, ".opencode"))).toBe(false)
+    } finally {
+      await cleanup?.()
+      fs.rmSync(sessionDir, { recursive: true, force: true })
+    }
   })
 
   test("built OpenClaw entrypoint imports under Node without Bun globals", () => {

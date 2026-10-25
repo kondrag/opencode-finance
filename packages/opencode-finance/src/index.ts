@@ -243,8 +243,14 @@ const authTierField = () => ({
 export default Plugin.define({
   id: "opencode-finance",
   async setup(ctx) {
-    const directory = ctx.location.directory
     const tools = await prepareTools()
+
+    // The session's location can change after setup (session moves, worktrees),
+    // so resolve the working directory per call instead of pinning it here.
+    const resolveDirectory = async (sessionID: string): Promise<string> => {
+      const session = await ctx.session.get({ sessionID }).catch(() => undefined)
+      return session?.location?.directory ?? ctx.location.directory
+    }
 
     await ctx.tool.transform((editor) => {
       for (const tool of tools) {
@@ -253,6 +259,7 @@ export default Plugin.define({
           description: tool.description,
           input: tool.parameters,
           async execute(input, context) {
+            const directory = await resolveDirectory(context.sessionID)
             const result = await tool.execute(input as any, {
               directory,
               worktree: "/",
@@ -290,6 +297,7 @@ export default Plugin.define({
           name: command.name,
           description: command.description,
           async execute({ sessionID, prompt, delivery }) {
+            const directory = await resolveDirectory(sessionID)
             const args = parseArgs(prompt.text)
             let text = expandTemplate(command.template, args)
 
@@ -339,13 +347,7 @@ export default Plugin.define({
       if (!connection) return
       const credential = await ctx.integration.connection.resolve(connection)
       if (!credential || credential.type !== "key") return
-      const parsed = Auth.Api.safeParse({
-        type: "api",
-        key: credential.key,
-        provider_tier: credential.metadata?.provider_tier,
-        provider_tag: credential.metadata?.provider_tag,
-      })
-      return parsed.success ? parsed.data : undefined
+      return Auth.fromKeyCredential(credential)
     })
 
     return () => Auth.use(undefined)
