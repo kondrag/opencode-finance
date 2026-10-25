@@ -34,29 +34,65 @@ export namespace Auth {
    *
    * V2 key-method integrations persist form answers verbatim as credential
    * metadata, so the Quiver tier select is stored under `metadata.tier`,
-   * while credentials saved since V1 use `provider_tier`/`provider_tag`.
-   * This helper accepts both spellings and derives `provider_tag` from the
-   * presence of a tier field. Unrecognized tier/tag values are dropped so the
-   * key still works (the tools degrade to the public tier with a warning).
+   * while V1-era credentials may carry `provider_tier`/`provider_tag`
+   * either nested under `metadata` (the V1 `authorize()` output shape) or
+   * flat on the credential itself (the legacy `auth.json` shape).
+   *
+   * The first *valid* spelling wins; unrecognized tier/tag values are
+   * dropped so the key still works (the tools degrade to the public tier
+   * with a warning). A `provider_tag` is derived from the presence of any
+   * tier field, matching the V1 auth shape.
    */
   export function fromKeyCredential(credential: {
     key: string
+    provider_tier?: unknown
+    provider_tag?: unknown
     metadata?: Record<string, unknown> | undefined
   }): Info | undefined {
     if (typeof credential.key !== "string" || credential.key.length === 0) return undefined
     const metadata = credential.metadata ?? {}
-    const rawTier = metadata.provider_tier ?? metadata.tier
-    const hasTierField = typeof rawTier === "string" && rawTier.length > 0
-    const rawTag = metadata.provider_tag ?? (hasTierField ? "quiver-quant" : undefined)
-    const tier = Api.shape.provider_tier.safeParse(rawTier)
-    const tag = Api.shape.provider_tag.safeParse(rawTag)
+    const tierCandidates = [metadata.provider_tier, metadata.tier, credential.provider_tier]
+    const tagCandidates = [metadata.provider_tag, credential.provider_tag]
+    const parseTier = (value: unknown) => {
+      const parsed = Api.shape.provider_tier.safeParse(value)
+      return parsed.success ? parsed.data : undefined
+    }
+    const parseTag = (value: unknown) => {
+      const parsed = Api.shape.provider_tag.safeParse(value)
+      return parsed.success ? parsed.data : undefined
+    }
+    let tier: z.infer<typeof Api.shape.provider_tier> | undefined
+    for (const candidate of tierCandidates) {
+      tier = parseTier(candidate)
+      if (tier) break
+    }
+    const hasTierField = tierCandidates.some((value) => typeof value === "string" && value.length > 0)
+    let tag: z.infer<typeof Api.shape.provider_tag> | undefined
+    for (const candidate of tagCandidates) {
+      tag = parseTag(candidate)
+      if (tag) break
+    }
+    tag ??= hasTierField ? "quiver-quant" : undefined
     const parsed = Api.safeParse({
       type: "api",
       key: credential.key,
-      ...(tier.success ? { provider_tier: tier.data } : {}),
-      ...(tag.success ? { provider_tag: tag.data } : {}),
+      ...(tier ? { provider_tier: tier } : {}),
+      ...(tag ? { provider_tag: tag } : {}),
     })
     return parsed.success ? parsed.data : undefined
+  }
+
+  /**
+   * Re-attach tier metadata from the legacy `auth.json` entry when a V2
+   * credential resolved without one. Legacy credential migration keeps only
+   * `type` and `key`, so a V1 paid-tier Quiver entry would otherwise
+   * silently degrade to the public tier even though `auth.json` still
+   * holds the tier. The V2 credential always wins when it carries a tier.
+   */
+  export function mergeLegacyCredential<T extends Info>(resolved: T, legacy: Info | undefined): T {
+    if (resolved.type !== "api" || resolved.provider_tier) return resolved
+    if (legacy?.type !== "api" || !legacy.provider_tier) return resolved
+    return { ...resolved, provider_tier: legacy.provider_tier, provider_tag: legacy.provider_tag }
   }
 
   const filepath = path.join(Global.Path.data, "auth.json")
@@ -68,7 +104,13 @@ export namespace Auth {
   export async function get(providerID: string) {
     if (source) {
       const resolved = await source(providerID).catch(() => undefined)
-      if (resolved) return resolved
+      if (resolved) {
+        if (resolved.type !== "api" || resolved.provider_tier) return resolved
+        // V2 credential lacks tier metadata; consult the legacy file before
+        // giving up on it (see mergeLegacyCredential).
+        const legacy = (await all())[providerID]
+        return mergeLegacyCredential(resolved, legacy)
+      }
     }
     const auth = await all()
     return auth[providerID]

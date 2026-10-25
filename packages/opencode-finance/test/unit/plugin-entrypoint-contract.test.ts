@@ -224,7 +224,9 @@ describe("plugin package entrypoint contract", () => {
     const entrypoint = await loadEntrypoint()
     const plugin = entrypoint.default as { id: string; setup: (context: unknown) => Promise<unknown> }
     const sessionDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "opencode-finance-report-dir-")))
+    const setupDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "opencode-finance-report-setup-")))
     const { context, commands, onPrompt, onSessionGet } = createStubContext()
+    context.location.directory = setupDir
     onPrompt(async () => {})
     onSessionGet(async () => ({ location: { directory: sessionDir } }))
 
@@ -246,10 +248,97 @@ describe("plugin package entrypoint contract", () => {
       expect(fs.statSync(skill).size).toBeGreaterThan(0)
 
       // The setup directory must not receive the skill as a fallback.
-      expect(fs.existsSync(path.join(packageDir, ".opencode"))).toBe(false)
+      expect(fs.existsSync(path.join(setupDir, ".opencode"))).toBe(false)
     } finally {
       await cleanup?.()
       fs.rmSync(sessionDir, { recursive: true, force: true })
+      fs.rmSync(setupDir, { recursive: true, force: true })
+    }
+  })
+
+  test("tool executor resolves the session directory per call", async () => {
+    const entrypoint = await loadEntrypoint()
+    const plugin = entrypoint.default as { id: string; setup: (context: unknown) => Promise<unknown> }
+    const sessionDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "opencode-finance-tool-dir-")))
+    const setupDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "opencode-finance-tool-setup-")))
+    const { context, tools, onSessionGet } = createStubContext()
+    context.location.directory = setupDir
+    onSessionGet(async () => ({ location: { directory: sessionDir } }))
+    const asks: Array<{ action?: string; metadata?: Record<string, unknown> }> = []
+    ;(context as any).permission = {
+      assert: async (input: { action?: string; metadata?: Record<string, unknown> }) => {
+        asks.push(input)
+      },
+    }
+
+    const cleanup = await plugin.setup(context)
+    try {
+      const pdf = tools.find((tool) => tool.name === "report_pdf")
+      expect(pdf).toBeTruthy()
+
+      // report_pdf resolves its relative outputRoot against the directory the
+      // executor passed down, then emits a `read` permission ask carrying the
+      // resolved path — before touching artifacts or the network.
+      await (pdf as any).execute(
+        { subcommand: "report", outputRoot: "reports/PROBE/2026-01-01" },
+        {
+          sessionID: "ses_tool_dir",
+          agent: "build",
+          messageID: "msg_tool_dir",
+          id: "too_tool_dir",
+          signal: new AbortController().signal,
+          progress: async () => {},
+        },
+      ).then(
+        () => {},
+        () => {},
+      )
+
+      const readAsk = asks.find((ask) => ask.action === "read")
+      expect(readAsk).toBeTruthy()
+      const outputRoot = String(readAsk?.metadata?.outputRoot)
+      expect(outputRoot.startsWith(sessionDir)).toBe(true)
+      expect(outputRoot.startsWith(setupDir)).toBe(false)
+    } finally {
+      await cleanup?.()
+      fs.rmSync(sessionDir, { recursive: true, force: true })
+      fs.rmSync(setupDir, { recursive: true, force: true })
+    }
+  })
+
+  test("directory fallback is observable when the session lookup fails", async () => {
+    const entrypoint = await loadEntrypoint()
+    const plugin = entrypoint.default as { id: string; setup: (context: unknown) => Promise<unknown> }
+    const setupDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "opencode-finance-fallback-")))
+    const { context, commands } = createStubContext()
+    context.location.directory = setupDir
+    // No onSessionGet: the stub's session.get rejects, forcing the fallback.
+
+    const warnings: string[] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "))
+    }
+
+    const cleanup = await plugin.setup(context)
+    try {
+      const report = commands.find((command) => command.name === "report")
+      expect(report).toBeTruthy()
+      await report!.execute({ sessionID: "ses_fallback_probe", prompt: { text: "AAPL" }, delivery: "steer" }).then(
+        () => {},
+        () => {},
+      )
+
+      expect(warnings.some((line) => line.includes("ses_fallback_probe"))).toBe(true)
+
+      // The fallback still writes to the setup directory — that is the
+      // documented degradation — but it is now signalled.
+      const skill = path.join(setupDir, ".opencode", "skills", "finance-comprehensive-report", "SKILL.md")
+      expect(fs.existsSync(skill)).toBe(true)
+    } finally {
+      console.warn = originalWarn
+      await cleanup?.()
+      fs.rmSync(setupDir, { recursive: true, force: true })
     }
   })
 

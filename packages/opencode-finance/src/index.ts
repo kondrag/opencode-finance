@@ -247,9 +247,21 @@ export default Plugin.define({
 
     // The session's location can change after setup (session moves, worktrees),
     // so resolve the working directory per call instead of pinning it here.
+    // A failed lookup must not break execution, but it must not stay silent
+    // either: the fallback is the setup-time directory, which is stale after
+    // a session move — exactly what per-call resolution exists to avoid.
+    const warnedSessions = new Set<string>()
     const resolveDirectory = async (sessionID: string): Promise<string> => {
       const session = await ctx.session.get({ sessionID }).catch(() => undefined)
-      return session?.location?.directory ?? ctx.location.directory
+      const directory = session?.location?.directory
+      if (!directory && !warnedSessions.has(sessionID)) {
+        warnedSessions.add(sessionID)
+        console.warn(
+          `[opencode-finance] could not resolve the location of session ${sessionID}; ` +
+            `falling back to the plugin directory ${ctx.location.directory}`,
+        )
+      }
+      return directory ?? ctx.location.directory
     }
 
     await ctx.tool.transform((editor) => {
