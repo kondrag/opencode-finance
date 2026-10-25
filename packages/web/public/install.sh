@@ -41,6 +41,15 @@ if ! command -v opencode >/dev/null 2>&1; then
   exit 1
 fi
 
+OPENCODE_VERSION_OUTPUT="$(opencode --version 2>/dev/null || true)"
+OPENCODE_MAJOR="$(printf '%s' "$OPENCODE_VERSION_OUTPUT" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)"
+if [[ -z "$OPENCODE_MAJOR" ]] || (( OPENCODE_MAJOR < 2 )); then
+  echo "error: opencode-finance requires OpenCode 2.x or later (v2 plugin API)" >&2
+  echo "Detected: ${OPENCODE_VERSION_OUTPUT:-no version output from 'opencode --version'}" >&2
+  echo "Upgrade OpenCode: curl -fsSL ${OPENCODE_INSTALL_URL} | bash" >&2
+  exit 1
+fi
+
 export OPENCODE_SCHEMA_URL
 export OPENCODE_PLUGIN
 export OPENCODE_CONFIG_DIR

@@ -5,6 +5,10 @@ This repository contains:
 - `packages/opencode-finance`: OpenCode finance plugin package.
 - `packages/web`: standalone marketing page deployed on Vercel.
 
+## Requirements
+
+- **OpenCode 2.x or later.** The plugin uses the OpenCode v2 plugin API and is not compatible with OpenCode 1.x. Check your version with `opencode --version`.
+
 ## Setup
 
 Run the one-shot installer:
